@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MTM Daily Trip Log</title>
+<style>
+  :root { --ink:#1d2b2a; --muted:#5d6e6c; --paper:#f3f6f5; --card:#fff; --line:#c9d6d3; --accent:#0f6b61; --bad:#b3261e; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.45 "Segoe UI", system-ui, sans-serif; }
+  main { max-width:860px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:1.6rem; margin:0 0 4px; text-align:center; }
+  .sub { color:var(--muted); margin:0 0 20px; text-align:center; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:18px; margin-bottom:18px; }
+  h2 { font-size:1.05rem; margin:0 0 14px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px 18px; }
+  @media (max-width:640px) { .grid { grid-template-columns:1fr; } }
+  label { display:block; font-weight:600; font-size:.9rem; margin-bottom:4px; }
+  input, select { width:100%; padding:10px; font:inherit; border:1px solid var(--line); border-radius:4px; background:#fff; }
+  input:focus, select:focus, button:focus-visible { outline:3px solid #7fc4bb; outline-offset:1px; }
+  input:invalid:not(:placeholder-shown), select:invalid.touched, input.touched:invalid { border-color:var(--bad); }
+  .hint { font-size:.8rem; color:var(--muted); margin-top:3px; }
+  .leg { border:1px solid var(--line); border-left:5px solid var(--accent); border-radius:6px; padding:14px; margin-bottom:14px; }
+  .leg-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; font-weight:700; }
+  .people { display:grid; grid-template-columns:1fr 1fr; gap:8px 18px; }
+  @media (max-width:640px) { .people { grid-template-columns:1fr; } }
+  .person { display:flex; align-items:center; gap:10px; font-weight:400; font-size:1rem; margin:0; padding:8px 10px; border:1px solid var(--line); border-radius:4px; cursor:pointer; }
+  .person input { width:auto; margin:0; }
+  .empty { color:var(--muted); font-size:.9rem; margin:0; }
+  button { font:inherit; font-weight:600; border-radius:4px; padding:10px 16px; cursor:pointer; border:1px solid var(--accent); }
+  .ghost { background:#fff; color:var(--accent); }
+  .link { background:none; border:none; color:var(--bad); padding:4px; }
+  #submit { background:var(--accent); color:#fff; width:100%; padding:14px; font-size:1.05rem; }
+  #submit:disabled { background:#9db5b1; border-color:#9db5b1; cursor:not-allowed; }
+  .cert { font-size:.85rem; color:var(--muted); margin:0 0 14px; }
+  #msg { margin-top:12px; padding:12px; border-radius:4px; display:none; }
+  #msg.ok { display:block; background:#e1f3ef; color:#0b4d45; }
+  #msg.err { display:block; background:#fbe6e4; color:var(--bad); }
+  .status { text-align:center; color:var(--muted); font-size:.85rem; margin-top:8px; }
+
+  /* Plain-language help box under "Individuals onboard" */
+  .explain { font-size:1.05rem; line-height:1.5; background:#eef7f5; border-left:5px solid var(--accent);
+             border-radius:4px; padding:12px 14px; margin:0 0 14px; color:var(--ink); }
+
+  /* Driver's license help */
+  .count { font-size:.9rem; font-weight:700; margin-top:4px; color:var(--muted); }
+  .count.good { color:#1e7a3c; }
+  .lichelp { grid-column:1 / -1; background:#eef7f5; border-left:5px solid var(--accent); border-radius:4px; padding:12px 14px; }
+  .lichelp summary { cursor:pointer; font-weight:700; font-size:1.05rem; }
+  .lichelp h3 { font-size:1rem; margin:16px 0 6px; }
+  .lichelp p, .lichelp li { font-size:1rem; line-height:1.55; }
+  .lichelp ol, .lichelp ul { margin:6px 0 6px 22px; padding:0; }
+  .lichelp li { margin-bottom:6px; }
+  .lichelp svg { display:block; width:100%; max-width:420px; height:auto; margin:10px 0; }
+  .lichelp .warnbox { background:#fff6e0; border-left:5px solid #c98a00; border-radius:4px; padding:10px 12px; margin:10px 0; }
+
+  /* Full-screen success message shown after a successful submit */
+  #done { display:none; position:fixed; inset:0; z-index:1000; background:#fff;
+          flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:24px; }
+  #done.show { display:flex; }
+  #done svg { width:min(60vw, 280px); height:auto; }
+  #done .circle { fill:none; stroke:#1e9e4a; stroke-width:6; stroke-dasharray:302; stroke-dashoffset:302; animation:draw .6s ease forwards; }
+  #done .tick { fill:none; stroke:#1e9e4a; stroke-width:8; stroke-linecap:round; stroke-linejoin:round; stroke-dasharray:70; stroke-dashoffset:70; animation:draw .4s .5s ease forwards; }
+  @keyframes draw { to { stroke-dashoffset:0; } }
+  #done h2 { font-size:clamp(1.8rem, 6vw, 3rem); color:#1e9e4a; margin:24px 0 28px; }
+  #again { background:#fff; color:var(--accent); padding:12px 22px; font-size:1rem; }
+
+  /* Full-screen loading message shown while the log is being submitted */
+  #loading { display:none; position:fixed; inset:0; z-index:1100; background:#fff;
+             flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:24px; }
+  #loading.show { display:flex; }
+  .spinner { width:90px; height:90px; border:10px solid #d6e6e3; border-top-color:var(--accent); border-radius:50%; animation:spin 1s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #loading h2 { font-size:clamp(1.5rem, 5vw, 2.4rem); margin:26px 0 12px; color:var(--ink); }
+  #loading .warn { font-size:clamp(1.1rem, 3.5vw, 1.5rem); font-weight:700; color:var(--bad);
+                   background:#fbe6e4; border-radius:6px; padding:14px 18px; max-width:560px; }
+
+  /* Driver mismatch popup */
+  #driverModal { display:none; position:fixed; inset:0; z-index:1200; background:rgba(0,0,0,.55);
+                 align-items:center; justify-content:center; padding:16px; }
+  #driverModal.show { display:flex; }
+  #driverModal .box { background:#fff; border-radius:8px; max-width:480px; width:100%; padding:24px;
+                      border-top:8px solid var(--bad); box-shadow:0 10px 40px rgba(0,0,0,.35); }
+  #driverModal h2 { color:var(--bad); font-size:1.4rem; margin:0 0 12px; }
+  #driverModal p { font-size:1.05rem; margin:0 0 12px; }
+  #driverModal .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
+  #driverModal .actions a, #driverModal .actions button { flex:1; text-align:center; text-decoration:none;
+                      padding:12px 16px; border-radius:4px; font-weight:600; font-size:1rem; border:1px solid var(--accent); }
+  #driverModal #dmFix { background:var(--accent); color:#fff; }
+  #driverModal #dmEmail { background:#fff; color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>MTM, Inc. Daily Trip Log</h1>
+  <p class="sub">Diversity Residential Homes &middot; Vendor Code 1I7M. Every field is required.</p>
+
+  <form id="f" novalidate>
+    <section>
+      <h2>Trip details</h2>
+      <div class="grid">
+        <div><label for="home">Home</label>
+          <select id="home" required><option value="">Select a home</option></select></div>
+        <div><label for="shift">AM or PM trip</label>
+          <select id="shift" required>
+            <option value="">Select</option><option value="AM">AM</option><option value="PM">PM</option>
+          </select></div>
+        <div><label for="serviceDate">Date of service</label>
+          <input id="serviceDate" type="date" required></div>
+        <div><label for="license">Driver's license number</label>
+          <input id="license" autocomplete="off" required minlength="9" maxlength="9" pattern="[A-Za-z][0-9]{8}"
+                 title="1 letter followed by 8 numbers (9 characters total)">
+          <div class="count" id="licCount" aria-live="polite">0 of 9 characters typed</div>
+          <div class="hint">Type 1 letter followed by 8 numbers. Spaces and dashes are removed for you.</div></div>
+
+        <div class="lichelp">
+          <details>
+            <summary>Not sure where to find the driver's license number? Tap here for help</summary>
+
+            <h3>What is it?</h3>
+            <p>It is the long number printed on the driver's <strong>license card</strong> (the plastic ID card the driver carries in a wallet).
+               It is the number that belongs to <strong>that driver only</strong>. This form needs <strong>exactly 9 characters: 1 letter followed by 8 numbers</strong>.</p>
+
+            <h3>Where do I find it?</h3>
+            <svg viewBox="0 0 420 250" role="img" aria-label="Example drawing of the front of a driver's license with the license number line highlighted">
+              <rect x="4" y="4" width="412" height="242" rx="14" fill="#fff" stroke="#1d2b2a" stroke-width="3"/>
+              <rect x="4" y="4" width="412" height="40" rx="14" fill="#0f6b61"/>
+              <text x="210" y="31" text-anchor="middle" font-size="20" font-weight="700" fill="#fff" font-family="Segoe UI, sans-serif">DRIVER'S LICENSE</text>
+              <rect x="22" y="62" width="100" height="125" rx="6" fill="#d6e6e3" stroke="#5d6e6c" stroke-width="2"/>
+              <circle cx="72" cy="106" r="20" fill="#9db5b1"/>
+              <path d="M38 180 Q72 128 106 180 Z" fill="#9db5b1"/>
+              <text x="72" y="204" text-anchor="middle" font-size="12" fill="#5d6e6c" font-family="Segoe UI, sans-serif">PHOTO</text>
+              <rect x="138" y="58" width="266" height="38" rx="6" fill="#fff3b0" stroke="#b3261e" stroke-width="4"/>
+              <text x="146" y="74" font-size="11" fill="#5d6e6c" font-family="Segoe UI, sans-serif">LICENSE NO. / DL / DLN</text>
+              <text x="146" y="91" font-size="18" font-weight="700" fill="#1d2b2a" font-family="Consolas, monospace" letter-spacing="2">A 1 2 3 4 5 6 7 8</text>
+              <text x="138" y="124" font-size="13" fill="#5d6e6c" font-family="Segoe UI, sans-serif">NAME: (driver's name)</text>
+              <text x="138" y="148" font-size="13" fill="#5d6e6c" font-family="Segoe UI, sans-serif">ADDRESS: (driver's address)</text>
+              <text x="138" y="172" font-size="13" fill="#5d6e6c" font-family="Segoe UI, sans-serif">BIRTH DATE &middot; EXPIRES</text>
+              <text x="210" y="238" text-anchor="middle" font-size="11" fill="#b3261e" font-weight="700" font-family="Segoe UI, sans-serif">EXAMPLE ONLY - every state's card looks a little different</text>
+            </svg>
+            <ol>
+              <li>Take the driver's license <strong>card</strong> out of the wallet and look at the <strong>front</strong> (the side with the driver's photo).</li>
+              <li>Look near the <strong>top</strong>, or right next to or under the <strong>photo</strong>. Find a label that says
+                  <strong>"LICENSE NO."</strong>, <strong>"LIC NO."</strong>, <strong>"DL"</strong>, <strong>"DLN"</strong>, or sometimes just the number <strong>"4d"</strong> in front of it.</li>
+              <li>The number printed next to that label is the one you need. It should be <strong>1 letter followed by 8 numbers</strong>, and some cards print it with dashes or spaces.</li>
+              <li>Type it into the box above. <strong>Leave out any dashes or spaces</strong> (the box removes them for you). The letter can be capital or small.</li>
+              <li>Watch the counter under the box. When it says <strong>"9 of 9 characters"</strong> in green, you are done.</li>
+            </ol>
+
+            <div class="warnbox">
+              <strong>Careful - do NOT use these:</strong>
+              <ul>
+                <li>The <strong>birth date</strong> or the <strong>expiration date</strong>.</li>
+                <li>The <strong>"Document", "Audit", "Control" or "Discriminator"</strong> number (often on the back or in tiny print). That is a different number.</li>
+                <li>A <strong>Social Security number</strong>, or the van's license plate or VIN.</li>
+              </ul>
+            </div>
+
+            <h3>Common problems</h3>
+            <ul>
+              <li><strong>"My counter says fewer than 9."</strong> Look again for a missing letter or number at the start or end. The form will not submit until all 9 are typed.</li>
+              <li><strong>"My counter says more than 9."</strong> You probably typed a different number, or typed something extra. The box stops at 9.</li>
+              <li><strong>Is it a zero or the letter O?</strong> Only the first character can be a letter, so the other 8 are numbers (zeros). If you cannot tell, ask the driver or check the card in better light.</li>
+              <li><strong>The driver does not have the card with them?</strong> Do not guess. Ask the driver, or ask your supervisor before submitting.</li>
+            </ul>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Trip</h2>
+      <p class="cert">A signature is required for the transport.</p>
+      <div id="legs"></div>
+    </section>
+
+    <section>
+      <h2>Individuals onboard</h2>
+      <p class="explain">
+        <strong>Who rode in the van?</strong><br>
+        Tap the box next to each person who rode with you on this trip. A check mark means "<strong>yes, they rode</strong>."
+        If someone stayed home and did not ride, leave their box empty.
+      </p>
+      <div id="people"><p class="empty">Select a home and AM or PM to see its individuals.</p></div>
+    </section>
+
+    <section>
+      <h2>Driver certification</h2>
+      <p class="cert">I certify that all information contained herein is true and accurate, and understand that this statement is made subject to the applicable penalties under federal and state law for making false declarations.</p>
+      <div class="grid">
+        <div><label for="driverSignature">Driver's signature (type full name)</label>
+          <input id="driverSignature" autocomplete="off" required></div>
+        <div><label for="driverName">Driver's printed name</label>
+          <input id="driverName" autocomplete="off" required></div>
+      </div>
+    </section>
+
+    <button type="submit" id="submit" disabled>Submit trip log</button>
+    <div class="status" id="status">Complete every field to enable submit.</div>
+    <div id="msg" role="status"></div>
+  </form>
+</main>
+
+<!-- Full-screen loading message -->
+<div id="loading" role="alert" aria-live="assertive">
+  <div class="spinner" aria-hidden="true"></div>
+  <h2>Submitting your trip log...</h2>
+  <p class="warn">Do NOT close this tab or leave this page until the green check mark appears.</p>
+</div>
+
+<!-- Full-screen success message -->
+<div id="done" role="alert" aria-live="assertive">
+  <svg viewBox="0 0 100 100" aria-hidden="true">
+    <circle class="circle" cx="50" cy="50" r="48"/>
+    <path class="tick" d="M28 52 L44 68 L74 34"/>
+  </svg>
+  <h2>Trip Log has Been Submitted!</h2>
+  <button type="button" id="again">Submit another trip log</button>
+</div>
+
+<!-- Driver mismatch popup -->
+<div id="driverModal" role="alertdialog" aria-modal="true" aria-labelledby="dmTitle">
+  <div class="box">
+    <h2 id="dmTitle">&#9888; Driver information does not match</h2>
+    <p>The driver's name and license number you entered do <strong>not match our records</strong>.</p>
+    <p><strong>Please check for errors:</strong> make sure the name is spelled the same way as before and the license number is typed correctly.</p>
+    <p>If you believe everything is correct, contact
+      <a href="mailto:ITadmin@onediversity.org">ITadmin@onediversity.org</a> for help with your submission.</p>
+    <div class="actions">
+      <button type="button" id="dmFix">Go back and check</button>
+      <a id="dmEmail" href="mailto:ITadmin@onediversity.org?subject=Trip%20Log%20driver%20license%20help">Email IT Admin</a>
+    </div>
+  </div>
+</div>
+
+<template id="legTpl">
+  <div class="leg">
+    <div class="grid">
+      <div><label>Pick up / Leaving With Individuals</label><input data-k="arrival" type="time" required></div>
+      <div><label>Drop-off time</label><input data-k="dropoff" type="time" required></div>
+      <div><label>Attendant Signature (STAFF type your full name)</label>
+        <input data-k="signature" autocomplete="off" required></div>
+    </div>
+  </div>
+</template>
+
+<script>
+  var MAX_LEGS = 23;
+  var $ = function (s, r) { return (r || document).querySelector(s); };
+  var form = $("#f"), legsEl = $("#legs"), peopleEl = $("#people");
+  var rosterReq = 0;                         // guards against out-of-order responses when switching homes / shifts
+
+  function to12h(v) {                       // "15:05" -> "3:05 PM"
+    if (!v || v === "NS") return v;
+    var p = v.split(":"), h = +p[0], ap = h >= 12 ? "PM" : "AM";
+    return ((h % 12) || 12) + ":" + p[1] + " " + ap;
+  }
+  function toSheetDate(v) { var p = v.split("-"); return p[1] + "/" + p[2] + "/" + p[0]; }
+
+  function addLeg() {
+    if (legsEl.children.length >= MAX_LEGS) return;
+    var leg = $("#legTpl").content.firstElementChild.cloneNode(true);
+    legsEl.appendChild(leg); refresh();
+  }
+
+  // Loads the names from the "<home> AM" / "<home> PM" tab and shows them as checkboxes.
+  function renderPeople() {
+    var code = $("#home").value, shift = $("#shift").value, req = ++rosterReq;
+    peopleEl.innerHTML = "";
+    if (!code || !shift) {
+      peopleEl.innerHTML = '<p class="empty">Select a home and AM or PM to see its individuals.</p>';
+      return;
+    }
+    peopleEl.innerHTML = '<p class="empty">Loading individuals...</p>';
+    google.script.run
+      .withSuccessHandler(function (names) {
+        if (req !== rosterReq) return;
+        peopleEl.innerHTML = "";
+        if (!names || !names.length) {
+          peopleEl.innerHTML = '<p class="empty">No individuals are listed for this home and trip yet.</p>';
+          return;
+        }
+        var wrap = document.createElement("div");
+        wrap.className = "people";
+        names.forEach(function (n) {
+          var lab = document.createElement("label");
+          lab.className = "person";
+          var cb = document.createElement("input");
+          cb.type = "checkbox"; cb.className = "personBox"; cb.value = n;
+          lab.appendChild(cb);
+          lab.appendChild(document.createTextNode(n));
+          wrap.appendChild(lab);
+        });
+        peopleEl.appendChild(wrap);
+      })
+      .withFailureHandler(function (err) {
+        if (req !== rosterReq) return;
+        peopleEl.innerHTML = '<p class="empty">Could not load individuals: ' +
+          (err && err.message ? err.message : err) + '</p>';
+      })
+      .getHomeMembers(code, shift);
+  }
+  function selectedPeople() {
+    return Array.prototype.map.call(peopleEl.querySelectorAll(".personBox:checked"), function (c) { return c.value; });
+  }
+
+  // Submit stays disabled while the form is incomplete OR the driver name/license do not match our records
+  var driverBlocked = false;
+  function refresh() {
+    var ok = form.checkValidity() && !driverBlocked;
+    $("#submit").disabled = !ok;
+    $("#status").textContent = driverBlocked
+      ? "Driver name and license do not match our records. Check your entries or contact ITadmin@onediversity.org."
+      : (ok ? "Ready to submit." : "Complete every field to enable submit.");
+  }
+
+  // Driver's license: strip spaces/dashes, make capitals, first character a letter then 8 numbers,
+  // and show how many of 9 characters are typed
+  function updateLicCount() {
+    var lic = $("#license"), n = lic.value.length, c = $("#licCount");
+    c.textContent = n === 9 ? "9 of 9 characters - looks good!" : n + " of 9 characters typed";
+    c.className = "count" + (n === 9 ? " good" : "");
+  }
+  $("#license").addEventListener("input", function () {
+    var raw = this.value.toUpperCase(), clean = "";
+    for (var i = 0; i < raw.length && clean.length < 9; i++) {
+      var ch = raw.charAt(i);
+      if (clean.length === 0) { if (/[A-Z]/.test(ch)) clean += ch; }   // first character: letter only
+      else if (/[0-9]/.test(ch)) clean += ch;                           // the rest: numbers only
+    }
+    if (clean !== this.value) this.value = clean;
+    updateLicCount();
+  });
+  form.addEventListener("reset", function () { setTimeout(updateLicCount, 0); });
+
+  $("#home").addEventListener("change", renderPeople);
+  $("#shift").addEventListener("change", renderPeople);
+  form.addEventListener("input", refresh);
+  form.addEventListener("change", refresh);
+  form.addEventListener("focusout", function (e) { e.target.classList.add("touched"); });
+
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (!form.checkValidity()) { form.reportValidity(); return; }
+    var legs = Array.prototype.map.call(legsEl.children, function (l) {
+      var g = function (k) { return $('[data-k="' + k + '"]', l).value.trim(); };
+      return {
+        arrival: to12h(g("arrival")),
+        dropoff: to12h(g("dropoff")),
+        signature: g("signature")
+      };
+    });
+    var payload = {
+      home: $("#home").value, shift: $("#shift").value, serviceDate: toSheetDate($("#serviceDate").value),
+      license: $("#license").value.trim(),
+      driverName: $("#driverName").value.trim(), driverSignature: $("#driverSignature").value.trim(),
+      individuals: selectedPeople(),
+      legs: legs
+    };
+    var btn = $("#submit"), msg = $("#msg");
+    btn.disabled = true; btn.textContent = "Submitting..."; msg.className = "";
+    showLoading();
+    google.script.run
+      .withSuccessHandler(function (r) {
+        hideLoading();
+        // Clear the form behind the scenes, then cover the screen with the success message.
+        form.reset(); legsEl.innerHTML = ""; addLeg(); renderPeople();
+        Array.prototype.forEach.call(form.querySelectorAll(".touched"), function (el) { el.classList.remove("touched"); });
+        $("#serviceDate").value = todayStr();
+        driverBlocked = false;
+        btn.textContent = "Submit trip log"; msg.className = ""; refresh();
+        $("#done").classList.add("show");
+        document.body.style.overflow = "hidden";
+        $("#again").focus();
+      })
+      .withFailureHandler(function (err) {
+        hideLoading();
+        var m = (err && err.message) ? err.message : String(err);
+        // If the server rejects the driver name/license, show the popup too
+        if (/does not match our records/i.test(m)) { driverBlocked = true; showDriverModal(); }
+        msg.className = "err";
+        msg.textContent = "Not submitted: " + m + " Your entries are still here. Fix the problem and submit again.";
+        btn.textContent = "Submit trip log"; refresh();
+      })
+      .submitTripLog(payload);
+  });
+
+  // Loading screen: covers the page and warns if staff try to close the tab mid-submit
+  function showLoading() {
+    $("#loading").classList.add("show");
+    document.body.style.overflow = "hidden";
+    window.onbeforeunload = function (e) { e.preventDefault(); e.returnValue = ""; return ""; };
+  }
+  function hideLoading() {
+    $("#loading").classList.remove("show");
+    document.body.style.overflow = "";
+    window.onbeforeunload = null;
+  }
+
+  // "Submit another trip log" button on the success screen
+  $("#again").addEventListener("click", function () {
+    $("#done").classList.remove("show");
+    document.body.style.overflow = "";
+    window.scrollTo({ top: 0 });
+  });
+
+  function todayStr() {
+    var d = new Date(), m = ("0" + (d.getMonth() + 1)).slice(-2), day = ("0" + d.getDate()).slice(-2);
+    return d.getFullYear() + "-" + m + "-" + day;
+  }
+
+  // ---- Live driver check (name + license vs. the Drivers tab) ----
+  var driverReq = 0, driverTimer = null;
+  function showDriverModal() {
+    $("#driverModal").classList.add("show");
+    document.body.style.overflow = "hidden";
+    $("#dmFix").focus();
+  }
+  function hideDriverModal() {
+    $("#driverModal").classList.remove("show");
+    document.body.style.overflow = "";
+  }
+  function checkDriverNow() {
+    var name = $("#driverName").value.trim(), lic = $("#license").value;
+    var req = ++driverReq;
+    if (!name || lic.length !== 9) { driverBlocked = false; refresh(); return; }
+    google.script.run
+      .withSuccessHandler(function (r) {
+        if (req !== driverReq) return;               // ignore out-of-date answers
+        driverBlocked = (r && r.status === "mismatch");
+        refresh();
+        if (driverBlocked) showDriverModal();
+      })
+      .withFailureHandler(function () { if (req === driverReq) { driverBlocked = false; refresh(); } })
+      .checkDriver(name, lic);
+  }
+  function queueDriverCheck() {
+    clearTimeout(driverTimer);
+    driverBlocked = false; refresh();                // clear the old warning while they retype
+    driverTimer = setTimeout(checkDriverNow, 500);
+  }
+  $("#license").addEventListener("input", queueDriverCheck);
+  $("#driverName").addEventListener("input", queueDriverCheck);
+  $("#dmFix").addEventListener("click", function () {
+    hideDriverModal();
+    $("#license").focus();
+  });
+
+  $("#serviceDate").value = todayStr();
+  addLeg();
+  google.script.run.withSuccessHandler(function (homes) {
+    var sel = $("#home");
+    homes.forEach(function (h) {
+      var o = document.createElement("option"); o.value = h.code; o.textContent = h.label; sel.appendChild(o);
+    });
+    refresh();
+  }).getHomeList();
+</script>
+</body>
+</html>

@@ -1,0 +1,913 @@
+// ============================================================
+// CONFIGURATION — add one entry per home/property here.
+// Each home gets its own Gmail label and its own Drive folder.
+// ============================================================
+var HOMES = [
+  { name: "EX", gmailLabel: "example Trip Logs",         driveFolderId: "htrhjgfhjrt5y343edg4r4ty" },
+ 
+  // Add more homes like this. The individuals for a home are read from the
+  // "Member's Printed Name" column (B) of that home's "<code> AM" / "<code> PM" tab,
+  // so to add or remove someone, edit the names on the tab - nothing to change here.
+  // Alert emails for a home are NOT set here: they come from the Residential
+  // tab of the contacts doc (see CONTACTS_DOC_ID below).
+];
+
+// Submitted trip log forms (PDF attached) go to this address...
+var SUBMISSION_RECIPIENT = "triplog@onediversity.org";
+
+// ...and a copy of each submitted PDF is also emailed to the home's own contacts
+// (from the Residential tab). Set COPY_TO_PROGRAM_MANAGERS to true to include the Program Managers too.
+var COPY_TO_HOME_CONTACTS = true;
+var COPY_TO_PROGRAM_MANAGERS = false;
+
+var LOGS_PER_DAY = 2;
+var NOON_HOUR = 12; // Hour (24h, script timezone) that splits the "expect 1" / "expect 2" check
+
+// Font used for signatures on the sheet / PDF (attendant + driver).
+var SIGNATURE_FONT = "Pacifico";
+
+// ============================================================
+// ALERT CONTACTS — read live from the "Residential" tab of this Google Doc.
+// Edit the doc and the next alert uses the change; no code edits needed.
+//   - A table row whose FIRST cell has a home code (e.g. LN) or home name
+//     (e.g. Leno): every email in that row is alerted for that home only.
+//   - A table row whose first cell contains "Program Manager": every email in
+//     that row is alerted for ALL homes (and gets the weekly report).
+// ============================================================
+var CONTACTS_DOC_ID = "1gAOOQPrg35ZQ_qh33bheyeC51ytcYkUr8qopLPVc4yE";
+var CONTACTS_TAB_NAME = "Residential Matrix";
+// First-cell text that marks a Program Manager row (matches "Residential Program Manager I/II/III"
+// and "In Home & Sponsored Res PM"). Remove an entry to exclude those rows.
+var PM_ROW_KEYWORDS = ["program manager", "res pm"];
+
+var contactsCache_ = null;
+
+/** Reads the Residential tab once per run: { pm: [emails], homes: { "LN": [emails], ... } } */
+function loadContacts_() {
+  if (contactsCache_) return contactsCache_;
+
+  var doc = DocumentApp.openById(CONTACTS_DOC_ID);
+  var tab = doc.getTabs().filter(function (t) {
+    return t.getTitle().trim().toLowerCase() === CONTACTS_TAB_NAME.toLowerCase();
+  })[0];
+  if (!tab) throw new Error("Tab '" + CONTACTS_TAB_NAME + "' not found in the contacts doc.");
+
+  var emailRe = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+  var result = { pm: [], homes: {} };
+  var tables = tab.asDocumentTab().getBody().getTables();
+
+  tables.forEach(function (table) {
+    for (var r = 0; r < table.getNumRows(); r++) {
+      var row = table.getRow(r);
+      var first = row.getCell(0).getText().trim();
+      var rowText = [];
+      for (var c = 0; c < row.getNumCells(); c++) rowText.push(row.getCell(c).getText());
+      var emails = (rowText.join(" ").match(emailRe) || []).map(function (e) { return e.toLowerCase(); });
+      if (!emails.length) continue;
+
+      var firstLower = first.toLowerCase();
+      var isPm = PM_ROW_KEYWORDS.some(function (k) { return firstLower.indexOf(k) > -1; });
+      if (isPm) {
+        result.pm = result.pm.concat(emails);
+        continue;
+      }
+      // Compare with spaces/punctuation removed so "Buffalo Nickel (5bd)" matches "BuffaloNickel".
+      var firstNorm = firstLower.replace(/[^a-z0-9]/g, "");
+      HOMES.forEach(function (h) {
+        var labelNorm = h.gmailLabel.replace(/\s*Trip Logs$/i, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (firstNorm === h.name.toLowerCase() || firstNorm.indexOf(labelNorm) > -1) {
+          result.homes[h.name] = (result.homes[h.name] || []).concat(emails);
+        }
+      });
+    }
+  });
+
+  function uniq(a) { return a.filter(function (e, i) { return a.indexOf(e) === i; }); }
+  result.pm = uniq(result.pm);
+  Object.keys(result.homes).forEach(function (k) { result.homes[k] = uniq(result.homes[k]); });
+
+  contactsCache_ = result;
+  return result;
+}
+
+/** Home's own emails + all Program Managers, comma-separated. */
+function getAlertRecipients_(home) {
+  var c = loadContacts_();
+  var own = c.homes[home.name] || [];
+  var list = own.concat(c.pm);
+  list = list.filter(function (e, i) { return list.indexOf(e) === i; });
+  if (!own.length) {
+    Logger.log("[" + home.name + "] No emails found on the Residential tab; sending to Program Managers only.");
+  }
+  if (!list.length) throw new Error("No alert recipients found for " + home.name + ".");
+  return list.join(",");
+}
+
+/** Program Managers only (for the all-homes weekly report). */
+function getProgramManagerEmails_() {
+  var pm = loadContacts_().pm;
+  if (!pm.length) throw new Error("No Program Manager emails found on the Residential tab.");
+  return pm.join(",");
+}
+
+/** Run once from the editor to approve permissions and preview who gets what. */
+function testContacts() {
+  var c = loadContacts_();
+  Logger.log("Program Managers: " + c.pm.join(", "));
+  HOMES.forEach(function (h) {
+    Logger.log(h.name + " -> " + getAlertRecipients_(h));
+  });
+}
+
+// ============================================================
+// WebApp.gs — Trip Log web form back end.
+//
+// Each home has TWO tabs on the sheet: "<code> AM" and "<code> PM"
+// (e.g. "LN AM", "LN PM"). The form's AM/PM choice picks the tab.
+// Each submission makes a temporary COPY of that tab (or the "Template"
+// tab if the home has no AM/PM tab), fills in the copy, exports it
+// as a PDF to Drive, emails it, then deletes the copy. The original
+// tab/template is never edited. Each successful submission is also logged
+// on the "Submissions" tab, and drivers are tracked on the "Drivers" tab.
+// ============================================================
+var SHEET_ID = "1SwCoovvCUq0qAuTpnCxSqMKua9Hd_PTtcralMXBqWzQ";
+var TEMPLATE_TAB = "Template";
+
+// ---- Driver registry / submissions log ----
+var DRIVERS_TAB = "Drivers";
+var SUBMISSIONS_TAB = "Submissions";
+var IT_ADMIN_EMAIL = "ITadmin@onediversity.org";
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile("Index")
+    .setTitle("MTM Daily Trip Log")
+    .addMetaTag("viewport", "width=device-width, initial-scale=1");
+}
+
+function getHomeList() {
+  return HOMES.map(function (h) {
+    return { code: h.name, label: h.gmailLabel.replace(/\s*Trip Logs$/i, "") };
+  });
+}
+
+/** Validates the AM/PM value from the form and returns it normalized ("AM" or "PM"). */
+function normalizeShift_(shift) {
+  var s = String(shift || "").trim().toUpperCase();
+  if (s !== "AM" && s !== "PM") throw new Error("Choose AM or PM for the trip.");
+  return s;
+}
+
+/** Names for the "Individuals onboard" checkboxes: read from column B of the home's AM or PM tab. */
+function getHomeMembers(code, shift) {
+  var home = HOMES.filter(function (h) { return h.name === code; })[0];
+  if (!home) throw new Error("Unknown home: " + code);
+  shift = normalizeShift_(shift);
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  return readRoster_(getTemplateSheet_(ss, home, shift));
+}
+
+/** Names in the Member's Printed Name column of the trip rows, top to bottom. */
+function readRoster_(sheet) {
+  var L = locateLayout_(sheet);
+  var vals = sheet.getRange(L.firstTrip, L.col.name, L.lastTrip - L.firstTrip + 1, 1).getValues();
+  return vals.map(function (v) { return String(v[0]).trim(); }).filter(function (n) { return n; });
+}
+
+// ============================================================
+// DRIVER REGISTRY + SUBMISSION LOG
+// ============================================================
+
+/** Returns the named tab, creating it (with a bold, frozen header row) if it doesn't exist. */
+function getOrCreateTab_(ss, name, headers) {
+  var sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(headers);
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+  }
+  return sh;
+}
+
+/** Lowercase, trimmed, single-spaced, so "john  Smith" matches "John Smith". */
+function normalizeName_(n) {
+  return String(n || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * First time a driver name is seen: registers name + license on the Drivers tab.
+ * After that, the license typed must match the one on file for that name.
+ * A license that is already registered to a different driver is also rejected.
+ * Throws an error (shown to the user) on any mismatch.
+ */
+function verifyOrRegisterDriver_(ss, driverName, license) {
+  var wrongMsg = "The license number entered does not match our records for this driver. " +
+    "Please contact " + IT_ADMIN_EMAIL + " for further assistance.";
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var sh = getOrCreateTab_(ss, DRIVERS_TAB,
+      ["Driver Name", "License Number", "First Registered", "Last Submission"]);
+    sh.getRange("B:B").setNumberFormat("@");
+    var data = sh.getDataRange().getValues();
+    var nameKey = normalizeName_(driverName);
+    var nameRow = -1, licenseOwnedByOther = false;
+
+    for (var i = 1; i < data.length; i++) {
+      var rowName = normalizeName_(data[i][0]);
+      var rowLic = String(data[i][1]).trim().toUpperCase();
+      if (rowName === nameKey) nameRow = i + 1;
+      else if (rowLic === license) licenseOwnedByOther = true;
+    }
+
+    if (nameRow > -1) {
+      var stored = String(sh.getRange(nameRow, 2).getValue()).trim().toUpperCase();
+      if (stored !== license) throw new Error(wrongMsg);
+      sh.getRange(nameRow, 4).setValue(new Date());
+    } else {
+      if (licenseOwnedByOther) throw new Error(wrongMsg);
+      sh.appendRow([String(driverName).trim(), license, new Date(), new Date()]);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Live check called from the form as soon as the driver's name and license are typed.
+ * Read-only: it registers nothing and never reveals the stored license number.
+ * Returns { status: "incomplete" | "new" | "match" | "mismatch" }.
+ */
+function checkDriver(driverName, license) {
+  license = String(license || "").trim().toUpperCase();
+  var nameKey = normalizeName_(driverName);
+  if (!nameKey || !/^[A-Z][0-9]{8}$/.test(license)) return { status: "incomplete" };
+
+  var sh = SpreadsheetApp.openById(SHEET_ID).getSheetByName(DRIVERS_TAB);
+  if (!sh) return { status: "new" };
+
+  var data = sh.getDataRange().getValues();
+  var nameFound = false, licenseMatches = false, licenseOwnedByOther = false;
+  for (var i = 1; i < data.length; i++) {
+    var rowName = normalizeName_(data[i][0]);
+    var rowLic = String(data[i][1]).trim().toUpperCase();
+    if (rowName === nameKey) {
+      nameFound = true;
+      if (rowLic === license) licenseMatches = true;
+    } else if (rowLic === license) {
+      licenseOwnedByOther = true;
+    }
+  }
+  if (nameFound) return { status: licenseMatches ? "match" : "mismatch" };
+  if (licenseOwnedByOther) return { status: "mismatch" };
+  return { status: "new" };
+}
+
+/** Adds one row to the Submissions tab for a successful submission. */
+function logSubmission_(ss, home, shift, d, individuals, pdfName, fileUrl) {
+  var sh = getOrCreateTab_(ss, SUBMISSIONS_TAB,
+    ["Timestamp", "Date of Service", "Home", "Shift", "Driver Name",
+     "License Number", "Individuals Onboard", "Trips", "PDF Name", "PDF Link"]);
+  sh.getRange("F:F").setNumberFormat("@");
+  sh.appendRow([new Date(), d.serviceDate, home.name, shift, d.driverName,
+    d.license, individuals.join(", "), d.legs.length, pdfName, fileUrl]);
+}
+
+// The Pickup departure time is the Pick up / Leaving With Individuals time plus a random number of
+// minutes in this range (it is no longer copied from the Drop-off time).
+var DEPARTURE_MIN_MINUTES = 1;
+var DEPARTURE_MAX_MINUTES = 3;
+
+/**
+ * "3:05 PM" + a random minMin..maxMin minutes -> e.g. "3:08 PM".
+ * Handles the AM/PM flip and midnight rollover.
+ */
+function addRandomMinutes_(timeStr, minMin, maxMin) {
+  var m = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(String(timeStr).trim());
+  if (!m) throw new Error("Invalid pickup time: " + timeStr);
+  var h = (+m[1] % 12) + (m[3].toUpperCase() === "PM" ? 12 : 0);
+  var total = (h * 60 + (+m[2]) + minMin + Math.floor(Math.random() * (maxMin - minMin + 1))) % (24 * 60);
+  var hh = Math.floor(total / 60), mm = total % 60;
+  return ((hh % 12) || 12) + ":" + String(mm).padStart(2, "0") + " " + (hh >= 12 ? "PM" : "AM");
+}
+
+/**
+ * One trip's values, keyed by sheet column:
+ * AM/PM | Pickup arrival | Pickup departure | Drop off | Signature.
+ * The Scheduled pickup column is NOT written - whatever is already set on the tab stays as is.
+ * The Pickup departure column is the Pick up time plus a random few minutes;
+ * the Drop off column is the Drop-off time entered on the form.
+ */
+function tripRow_(shift, leg) {
+  return { ampm: shift, arrival: leg.arrival || "",
+           departure: leg.arrival ? addRandomMinutes_(leg.arrival, DEPARTURE_MIN_MINUTES, DEPARTURE_MAX_MINUTES) : "",
+           dropoff: leg.dropoff, sig: leg.signature };
+}
+var BLANK_ROW_ = { ampm: "", arrival: "", departure: "", dropoff: "", sig: "" };
+
+/**
+ * Writes the trip rows into the copy, one column at a time, using the columns found from the header row.
+ * The Scheduled pickup column is PROTECTED: it is never written, any field that points at the same
+ * column is skipped, and the column is restored exactly as it was (formulas stay formulas) afterward.
+ * The attendant Signature column is set in SIGNATURE_FONT (Pacifico).
+ */
+function writeTripRows_(sheet, L, rows) {
+  var n = rows.length;
+
+  // Snapshot the Scheduled pickup column exactly as the tab has it
+  var schedRng = sheet.getRange(L.firstTrip, L.col.sched, n, 1);
+  var keepVals = schedRng.getValues();
+  var keepForm = schedRng.getFormulas();
+  var keepFmt  = schedRng.getNumberFormats();
+
+  ["ampm", "arrival", "departure", "dropoff", "sig"].forEach(function (k) {   // "sched" is skipped on purpose
+    if (L.col[k] === L.col.sched) {
+      Logger.log("Skipped '" + k + "': it points at the Scheduled column (" + L.col.sched + ").");
+      return;
+    }
+    sheet.getRange(L.firstTrip, L.col[k], n, 1)
+      .setNumberFormat("@")
+      .setValues(rows.map(function (r) { return [r[k]]; }));
+  });
+
+  // Attendant signatures in a cursive font
+  if (L.col.sig !== L.col.sched) {
+    sheet.getRange(L.firstTrip, L.col.sig, n, 1).setFontFamily(SIGNATURE_FONT);
+  }
+
+  // Put the Scheduled column back exactly as it was
+  schedRng.setNumberFormats(keepFmt);
+  schedRng.setValues(keepVals.map(function (r, i) { return [keepForm[i][0] || r[0]]; }));
+}
+
+function submitTripLog(d) {
+  // ---- server-side validation: every field required ----
+  ["home", "shift", "serviceDate", "license", "driverName", "driverSignature"].forEach(function (k) {
+    if (!String(d[k] || "").trim()) throw new Error("Missing field: " + k);
+  });
+  if (!d.legs || !d.legs.length) throw new Error("Trip details are missing.");
+  d.legs.forEach(function (leg) {
+    ["dropoff", "signature"].forEach(function (k) {   // arrival is optional; the Pickup departure is calculated from it
+      if (!String(leg[k] || "").trim()) throw new Error("Trip is missing: " + k);
+    });
+  });
+
+  // ---- driver's license: 1 letter followed by 8 numbers (9 characters) ----
+  d.license = String(d.license).trim().toUpperCase();
+  if (!/^[A-Z][0-9]{8}$/.test(d.license)) {
+    throw new Error("The driver's license must be 1 letter followed by 8 numbers (9 characters total).");
+  }
+  // Block placeholder numbers: the 8 digits can't all be zeros (e.g. A00000000)
+  if (/^[A-Z]0{8}$/.test(d.license)) {
+    throw new Error("That driver's license number is not valid. Enter the number printed on the driver's license card.");
+  }
+
+  var home = HOMES.filter(function (h) { return h.name === d.home; })[0];
+  if (!home) throw new Error("Unknown home: " + d.home);
+  var shift = normalizeShift_(d.shift);
+
+  var individuals = (d.individuals || []).map(function (n) { return String(n).trim(); });
+
+  var now = new Date();
+  var stamp = Utilities.formatDate(now, Session.getScriptTimeZone(), "HHmmss");
+  // The trip date picked on the form decides which Drive day folder the file goes in.
+  var serviceDate = parseServiceDate_(d.serviceDate);
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var copy = null;
+
+  // ---- driver check: registers a new driver, or rejects a name/license mismatch ----
+  // Runs before anything is copied, filed or emailed, so a rejected submission leaves no trace.
+  verifyOrRegisterDriver_(ss, d.driverName, d.license);
+
+  try {
+    // ---- copy the home's AM or PM tab; the original tab is never edited ----
+    var source = getTemplateSheet_(ss, home, shift);
+    var roster = readRoster_(source);
+    individuals.forEach(function (n) {      // only names on this home's AM/PM tab are accepted
+      if (roster.indexOf(n) === -1) throw new Error("'" + n + "' is not listed for " + home.name + " " + shift + ".");
+    });
+    copy = source.copyTo(ss).setName(
+      "tmp_" + home.name + "_" + shift + "_" + stamp + "_" + Math.floor(Math.random() * 1000));
+    var L = locateLayout_(copy);
+    var rowsAvail = L.lastTrip - L.firstTrip + 1;
+
+    // ---- fill the COPY only (VIN and provider stay as set on the template) ----
+    copy.getRange(L.date, 2).setNumberFormat("@").setValue(d.serviceDate);
+    copy.getRange(L.license, 2).setNumberFormat("@").setValue(d.license);
+
+    // Only the trip columns are written, so the names and the trip number column stay untouched.
+    var rows;
+    if (roster.length) {
+      // Each named row: checked = the trip info goes on their row;
+      // not checked = only NS in the Drop Off Time column, everything else blank.
+      var trip = tripRow_(shift, d.legs[0]);
+      var names = copy.getRange(L.firstTrip, L.col.name, rowsAvail, 1).getValues();
+      rows = names.map(function (r) {
+        var name = String(r[0]).trim();
+        if (!name) return BLANK_ROW_;
+        if (individuals.indexOf(name) > -1) return trip;
+        return { ampm: "", arrival: "", departure: "", dropoff: "NS", sig: "" };
+      });
+    } else {
+      // No names on this tab: one row per trip, as before.
+      if (d.legs.length > rowsAvail) throw new Error("Not enough trip rows on the " + home.name + " " + shift + " tab.");
+      rows = [];
+      for (var i = 0; i < rowsAvail; i++) {
+        rows.push(d.legs[i] ? tripRow_(shift, d.legs[i]) : BLANK_ROW_);
+      }
+    }
+    writeTripRows_(copy, L, rows);
+
+    // Driver signature: label stays in the normal font, only the typed name is Pacifico
+    if (L.sig) {
+      var sigCell = copy.getRange(L.sig, 1);
+      var sigText = L.sigLabel + " " + d.driverSignature;
+      sigCell.setValue(sigText);
+      sigCell.setRichTextValue(
+        SpreadsheetApp.newRichTextValue()
+          .setText(sigText)
+          .setTextStyle(L.sigLabel.length + 1, sigText.length,
+            SpreadsheetApp.newTextStyle().setFontFamily(SIGNATURE_FONT).build())
+          .build()
+      );
+    }
+    if (L.pname) copy.getRange(L.pname, 1).setValue(L.pnameLabel + " " + d.driverName);
+    SpreadsheetApp.flush();
+
+    // ---- export the copy as a PDF into the date-of-service Drive day folder ----
+    var url = "https://docs.google.com/spreadsheets/d/" + SHEET_ID + "/export?format=pdf" +
+      "&gid=" + copy.getSheetId() + "&portrait=false&fitw=true&size=letter&gridlines=false";
+    var res = UrlFetchApp.fetch(url, { headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() } });
+    var pdfName = formatDatePrefix(serviceDate) + "_" + home.name + "_" + shift + "_Trip_Log_" + stamp + ".pdf";
+    var root = DriveApp.getFolderById(home.driveFolderId);
+    var dayFolder = getOrCreateDayFolder(
+      getOrCreateWeekFolder(
+        getOrCreateMonthFolder(getOrCreateYearFolder(root, serviceDate), serviceDate),
+        serviceDate),
+      serviceDate);
+    var pdfBlob = res.getBlob().setName(pdfName);
+    var file = dayFolder.createFile(pdfBlob);
+
+    // ---- log the submission on the "Submissions" tab ----
+    try {
+      logSubmission_(ss, home, shift, d, individuals, pdfName, file.getUrl());
+    } catch (e) {
+      Logger.log("[" + home.name + "] Submissions log failed: " + e.message);
+    }
+
+    // ---- submitted form goes to triplog@onediversity.org (SUBMISSION_RECIPIENT) ----
+    try {
+      sendSubmissionEmail_(home, shift, d, individuals, pdfBlob, pdfName, file.getUrl());
+    } catch (e) {
+      Logger.log("[" + home.name + "] Submission email failed: " + e.message);
+    }
+
+    // ---- copy of the PDF to the home's contacts (Residential tab) ----
+    try {
+      sendCopyEmail_(home, shift, d, individuals, pdfBlob, pdfName, file.getUrl());
+    } catch (e) {
+      Logger.log("[" + home.name + "] Copy email failed: " + e.message);
+    }
+
+    return { ok: true, file: pdfName, url: file.getUrl() };
+  } finally {
+    // The temporary copy is deleted whether or not the export succeeded.
+    try { if (copy) ss.deleteSheet(copy); } catch (e) { Logger.log("Copy cleanup failed: " + e.message); }
+  }
+}
+
+/** Turns the form's "MM/DD/YYYY" into a Date at noon (avoids timezone/DST day shifts). */
+function parseServiceDate_(s) {
+  var m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(s).trim());
+  if (!m) throw new Error("Invalid date of service: " + s);
+  var dt = new Date(+m[3], +m[1] - 1, +m[2], 12, 0, 0);
+  if (dt.getMonth() !== +m[1] - 1) throw new Error("Invalid date of service: " + s);
+  return dt;
+}
+
+/**
+ * The tab to copy: "<home> <AM|PM>" (e.g. "LN AM"). Matching ignores case and extra spaces.
+ * If that tab is missing it STOPS with a clear error that names the tab it wanted and
+ * lists the tabs it can see, instead of quietly using a blank tab. Never modified.
+ */
+function getTemplateSheet_(ss, home, shift) {
+  var want = (home.name + " " + shift).toLowerCase().replace(/\s+/g, " ");
+  var sheets = ss.getSheets();
+  var sheet = sheets.filter(function (s) {
+    return s.getName().trim().toLowerCase().replace(/\s+/g, " ") === want;
+  })[0];
+  if (!sheet) {
+    throw new Error("Tab '" + home.name + " " + shift + "' was not found. Tabs on the sheet: " +
+      sheets.map(function (s) { return s.getName(); }).join(", "));
+  }
+  return sheet;
+}
+
+/** Emails a submitted trip log (PDF attached) to SUBMISSION_RECIPIENT. */
+function sendSubmissionEmail_(home, shift, d, individuals, pdfBlob, pdfName, fileUrl) {
+  var body = "A trip log was submitted.\n\n" +
+    "Home: " + home.name + " " + shift + "\n" +
+    "Date of Service: " + d.serviceDate + "\n" +
+    "Driver: " + d.driverName + "\n" +
+    "License: " + d.license + "\n" +
+    "Individuals onboard: " + (individuals.length ? individuals.join(", ") : "none selected") + "\n" +
+    "Trips: " + d.legs.length + "\n\n" +
+    "Saved in Drive: " + fileUrl;
+  GmailApp.sendEmail(SUBMISSION_RECIPIENT, "[" + home.name + " " + shift + "] Trip Log Submitted - " + d.serviceDate, body, {
+    attachments: [pdfBlob.setName(pdfName)]
+  });
+}
+
+/** Emails a copy of the submitted PDF to the home's contacts (Residential tab). */
+function sendCopyEmail_(home, shift, d, individuals, pdfBlob, pdfName, fileUrl) {
+  if (!COPY_TO_HOME_CONTACTS) return;
+
+  var c = loadContacts_();
+  var list = (c.homes[home.name] || []).slice();
+  if (COPY_TO_PROGRAM_MANAGERS) list = list.concat(c.pm);
+  list = list.filter(function (e, i) { return list.indexOf(e) === i; });
+
+  if (!list.length) {
+    Logger.log("[" + home.name + "] No contacts found for the PDF copy; skipped.");
+    return;
+  }
+
+  var body = "A copy of the submitted trip log is attached.\n\n" +
+    "Home: " + home.name + " " + shift + "\n" +
+    "Date of Service: " + d.serviceDate + "\n" +
+    "Driver: " + d.driverName + "\n" +
+    "Individuals onboard: " + (individuals.length ? individuals.join(", ") : "none selected") + "\n\n" +
+    "Saved in Drive: " + fileUrl;
+
+  GmailApp.sendEmail(list.join(","),
+    "[" + home.name + " " + shift + "] Trip Log Copy - " + d.serviceDate,
+    body,
+    { attachments: [pdfBlob.setName(pdfName)] });
+  Logger.log("[" + home.name + "] PDF copy sent to: " + list.join(", "));
+}
+
+/**
+ * Finds the rows by their labels in column A, and the columns by the header row,
+ * so tabs whose rows or columns are shifted (e.g. an extra title row) still work.
+ * Returns: date, license, header, firstTrip, lastTrip, sig, pname rows and
+ * col = { name, ampm, sched, arrival, departure, dropoff, sig } (1-based column numbers).
+ */
+function locateLayout_(sheet) {
+  var vals = sheet.getRange(1, 1, sheet.getMaxRows(), 1).getValues();
+  var L = {};
+  for (var i = 0; i < vals.length; i++) {
+    var raw = String(vals[i][0]).trim(), t = raw.toUpperCase(), row = i + 1;
+    if (!L.date && t.indexOf("DATE OF SERVICE") === 0) L.date = row;
+    else if (!L.license && t.indexOf("DRIVER") === 0 && t.indexOf("LICENSE") > -1) L.license = row;
+    else if (!L.header && t.indexOf("MTM TRIP NUMBER") === 0) L.header = row;
+    else if (L.header && !L.note && (t.indexOf("EACH LEG") === 0 || t.indexOf("I CERTIFY") === 0)) L.note = row;
+    else if (!L.sig && t.indexOf("DRIVER") === 0 && t.indexOf("SIGNATURE") > -1) {
+      L.sig = row; L.sigLabel = raw.split(":")[0] + ":";
+    } else if (!L.pname && t.indexOf("DRIVER") === 0 && t.indexOf("PRINTED NAME") > -1) {
+      L.pname = row; L.pnameLabel = raw.split(":")[0] + ":";
+    }
+  }
+  if (!L.date || !L.license || !L.header) {
+    throw new Error("Could not find the Date / License / header rows on tab '" + sheet.getName() + "'.");
+  }
+  // Trip rows end right before the first note / certification / signature row under the header.
+  if (!L.note) {
+    var after = [L.sig, L.pname].filter(function (r) { return r && r > L.header; });
+    if (after.length) L.note = Math.min.apply(null, after);
+  }
+  L.firstTrip = L.header + 1;
+  L.lastTrip = L.note ? L.note - 1 : L.firstTrip;
+  if (L.lastTrip < L.firstTrip) L.lastTrip = L.firstTrip;
+
+  // Columns: found from the header row text; the standard B..H positions are the fallback.
+  L.col = { name: 2, ampm: 3, sched: 4, arrival: 5, departure: 6, dropoff: 7, sig: 8 };
+  var hdr = sheet.getRange(L.header, 1, 1, sheet.getMaxColumns()).getValues()[0];
+  hdr.forEach(function (cell, idx) {
+    var h = String(cell).toLowerCase().replace(/[^a-z0-9]/g, ""), c = idx + 1;
+    if (!h) return;
+    if (h.indexOf("printedname") > -1) L.col.name = c;
+    else if (h.indexOf("ampm") === 0) L.col.ampm = c;
+    else if (h.indexOf("scheduled") > -1) L.col.sched = c;
+    else if (h.indexOf("arrival") > -1 || h.indexOf("leavingwith") > -1) L.col.arrival = c;
+    else if (h.indexOf("departure") > -1) L.col.departure = c;
+    else if (h.indexOf("dropoff") > -1) L.col.dropoff = c;
+    else if (h.indexOf("signature") > -1) L.col.sig = c;
+  });
+  return L;
+}
+
+/**
+ * Run once from the editor (View > Logs): checks every home's AM and PM tab and prints
+ * what was found - the rows, the columns and the individuals - so a misread tab is easy to spot.
+ */
+function testSheetRead() {
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  HOMES.forEach(function (home) {
+    ["AM", "PM"].forEach(function (shift) {
+      try {
+        var sh = getTemplateSheet_(ss, home, shift), L = locateLayout_(sh), names = readRoster_(sh);
+        Logger.log(home.name + " " + shift + ": tab '" + sh.getName() + "' | header row " + L.header +
+          " | trip rows " + L.firstTrip + "-" + L.lastTrip + " | columns " + JSON.stringify(L.col) +
+          " | " + names.length + " individuals: " + names.join("; "));
+      } catch (e) {
+        Logger.log(home.name + " " + shift + ": PROBLEM - " + e.message);
+      }
+    });
+  });
+}
+
+// ============================================================
+// FOLDER HIERARCHY HELPERS (Root -> Year -> Month -> Week -> Day)
+// ============================================================
+
+function getOrCreateYearFolder(rootFolder, date) {
+  var yearName = String(date.getFullYear());
+  var existing = rootFolder.getFoldersByName(yearName);
+  if (existing.hasNext()) {
+    return existing.next();
+  }
+  Logger.log("Creating year folder: " + yearName);
+  return rootFolder.createFolder(yearName);
+}
+
+function getOrCreateMonthFolder(yearFolder, date) {
+  var monthNames = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+  ];
+  var mm = String(date.getMonth() + 1).padStart(2, "0");
+  var monthName = mm + " - " + monthNames[date.getMonth()];
+
+  var existing = yearFolder.getFoldersByName(monthName);
+  if (existing.hasNext()) {
+    return existing.next();
+  }
+  Logger.log("Creating month folder: " + monthName + " inside " + yearFolder.getName());
+  return yearFolder.createFolder(monthName);
+}
+
+function getOrCreateWeekFolder(parentFolder, date) {
+  var weekStart = getWeekStart(date);
+  var weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 6);
+
+  var folderName = formatDate(weekStart) + " to " + formatDate(weekEnd);
+
+  var existing = parentFolder.getFoldersByName(folderName);
+  if (existing.hasNext()) {
+    return existing.next();
+  }
+  Logger.log("Creating week folder: " + folderName + " inside " + parentFolder.getName());
+  return parentFolder.createFolder(folderName);
+}
+
+function getOrCreateDayFolder(weekFolder, date) {
+  var folderName = formatDate(date);
+  var existing = weekFolder.getFoldersByName(folderName);
+  if (existing.hasNext()) {
+    return existing.next();
+  }
+  Logger.log("Creating day folder: " + folderName + " inside " + weekFolder.getName());
+  return weekFolder.createFolder(folderName);
+}
+
+function getOrCreateSubfolder(parentFolder, folderName) {
+  var existing = parentFolder.getFoldersByName(folderName);
+  if (existing.hasNext()) {
+    return existing.next();
+  }
+  Logger.log("Creating folder: " + folderName + " inside " + parentFolder.getName());
+  return parentFolder.createFolder(folderName);
+}
+
+function getWeekStart(date) {
+  var d = new Date(date);
+  var day = d.getDay();
+  var diff = (day === 0) ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function formatDate(date) {
+  var mm = String(date.getMonth() + 1).padStart(2, "0");
+  var dd = String(date.getDate()).padStart(2, "0");
+  return mm + "-" + dd;
+}
+
+function formatDatePrefix(date) {
+  var yyyy = date.getFullYear();
+  var mm = String(date.getMonth() + 1).padStart(2, "0");
+  var dd = String(date.getDate()).padStart(2, "0");
+  return yyyy + "-" + mm + "-" + dd;
+}
+
+/**
+ * Counts the files directly inside a folder (not subfolders).
+ */
+function countFilesInFolder_(folder) {
+  var iterator = folder.getFiles();
+  var count = 0;
+  while (iterator.hasNext()) {
+    iterator.next();
+    count++;
+  }
+  return count;
+}
+
+// ============================================================
+// DAILY TRIP LOG ALERT SYSTEM (per home)
+//
+// Checks the ACTUAL number of files sitting in today's Drive day folder
+// (Root -> Year -> Month -> Week -> Day) against how many are expected by
+// this point in the day:
+//   - Before NOON_HOUR (default 12pm): expect 1
+//   - At/after NOON_HOUR:              expect LOGS_PER_DAY (default 2)
+//
+// Web form submissions export a PDF into that same day folder, so each
+// submitted log (AM or PM) counts as one file.
+//
+// Each home's alert goes only to that home's emails from the Residential tab
+// of the contacts doc, plus all Program Managers.
+//
+// Run via TWO time-based triggers on weekdays:
+// Apps Script editor > Triggers > Add Trigger > checkDailyTripLogs
+//   1) Day timer > 12pm - 1pm window   (checks the "expect 1" milestone)
+//   2) Day timer > 7pm - 8pm window    (checks the "expect 2" milestone)
+// ============================================================
+function checkDailyTripLogs() {
+  var today = new Date();
+  var dayOfWeek = today.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
+
+  if (dayOfWeek === 0 || dayOfWeek === 6) {
+    Logger.log("Weekend - no trip log check needed.");
+    return;
+  }
+
+  for (var h = 0; h < HOMES.length; h++) {
+    checkDailyTripLogsForHome_(HOMES[h], today);
+  }
+}
+
+function checkDailyTripLogsForHome_(home, today) {
+  var rootFolder = DriveApp.getFolderById(home.driveFolderId);
+  var yearFolder = getOrCreateYearFolder(rootFolder, today);
+  var monthFolder = getOrCreateMonthFolder(yearFolder, today);
+  var weekFolder = getOrCreateWeekFolder(monthFolder, today);
+  var dayFolder = getOrCreateDayFolder(weekFolder, today);
+
+  var actualCount = countFilesInFolder_(dayFolder);
+
+  var currentHour = today.getHours();
+  var isPastNoon = currentHour >= NOON_HOUR;
+  var expectedCount = isPastNoon ? LOGS_PER_DAY : 1;
+  var milestoneLabel = isPastNoon ? "end-of-day" : "midday";
+
+  var dayName = Utilities.formatDate(today, Session.getScriptTimeZone(), "EEEE");
+  var fullDateLabel = Utilities.formatDate(today, Session.getScriptTimeZone(), "EEEE, MMM d, yyyy");
+
+  Logger.log("[" + home.name + "] " + dayName + " (" + milestoneLabel + " check): " +
+    actualCount + " logs found in " + dayFolder.getName() + ", " + expectedCount + " expected.");
+
+  var subject, message;
+  if (actualCount >= expectedCount) {
+    subject = "[" + home.name + "] Trip Logs - Good Job! - " + fullDateLabel;
+    message = "Good job! All trip logs are in for the " + milestoneLabel + " check on " + dayName +
+      " (" + actualCount + " of " + expectedCount + " expected).\n\nHome: " + home.name;
+  } else {
+    var missing = expectedCount - actualCount;
+    subject = "[" + home.name + "] Missing Trip Logs - " + fullDateLabel;
+    message = "Missing Trip Logs: There are " + missing + " trip log(s) missing for the " + milestoneLabel +
+      " check on " + dayName + " (" + actualCount + " of " + expectedCount + " expected).\n\nHome: " + home.name;
+  }
+
+  Logger.log(message);
+
+  // Save this report so the morning trigger can resend the exact same message
+  PropertiesService.getScriptProperties().setProperty(
+    "lastTripLogReport_" + home.name,
+    JSON.stringify({ subject: subject, message: message, forDate: formatDate(today) })
+  );
+
+  sendTripLogEmail(home, subject, message);
+}
+
+/**
+ * Resends the previous evening's report as-is, first thing in the
+ * morning, as a reminder, for every home. Does not recalculate anything.
+ *
+ * Run via a time-based trigger early morning on weekdays:
+ * Apps Script editor > Triggers > Add Trigger > resendMorningTripLogReport
+ * > Time-driven > Day timer > 6am - 7am window.
+ */
+function resendMorningTripLogReport() {
+  var today = new Date();
+  var dayOfWeek = today.getDay();
+
+  if (dayOfWeek === 0 || dayOfWeek === 6) {
+    Logger.log("Weekend - no morning resend needed.");
+    return;
+  }
+
+  for (var h = 0; h < HOMES.length; h++) {
+    resendMorningReportForHome_(HOMES[h]);
+  }
+}
+
+function resendMorningReportForHome_(home) {
+  var stored = PropertiesService.getScriptProperties().getProperty("lastTripLogReport_" + home.name);
+  if (!stored) {
+    Logger.log("[" + home.name + "] No stored report found to resend.");
+    return;
+  }
+
+  var report = JSON.parse(stored);
+  Logger.log("[" + home.name + "] Resending morning report from " + report.forDate + ": " + report.message);
+  sendTripLogEmail(home, "[Reminder] " + report.subject, report.message);
+}
+
+/**
+ * Sends an email for a given home as a brand-new message every time, so
+ * Gmail treats each one as its own item instead of threading them together.
+ * Goes ONLY to that home's emails from the Residential tab of the contacts
+ * doc, plus all Program Managers listed there.
+ */
+function sendTripLogEmail(home, subject, message) {
+  GmailApp.sendEmail(getAlertRecipients_(home), subject, message);
+  Logger.log("[" + home.name + "] Sent email: " + subject);
+}
+
+// ============================================================
+// END-OF-WEEK REPORT (all homes, one email)
+//
+// Counts the files filed for each home across the whole week (Mon-Sun),
+// using each day's Drive folder, and emails ONE summary to the Program
+// Managers listed on the Residential tab of the contacts doc.
+// Each home is shown as total / 10 (LOGS_PER_DAY x 5 weekdays).
+//
+// Run via a time-based trigger on Fridays, after the 7pm daily check:
+// Apps Script editor > Triggers > Add Trigger > sendWeeklyTripLogReport
+// > Time-driven > Week timer > Every Friday > 8pm - 9pm.
+//
+// It only looks; it never creates folders. Files are counted under the
+// date of service, so a late submission for an earlier day in the week
+// is included if it was filed before the report runs.
+// ============================================================
+function sendWeeklyTripLogReport() {
+  var today = new Date();
+  var weekStart = getWeekStart(today);
+  var weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 6);
+
+  var tz = Session.getScriptTimeZone();
+  var expectedPerHome = LOGS_PER_DAY * 5;
+  var lines = [];
+
+  for (var h = 0; h < HOMES.length; h++) {
+    var home = HOMES[h];
+    var root = DriveApp.getFolderById(home.driveFolderId);
+    var total = 0;
+
+    for (var i = 0; i < 7; i++) {
+      var day = new Date(weekStart);
+      day.setDate(day.getDate() + i);
+      var folder = getExistingDayFolder_(root, day);
+      total += folder ? countFilesInFolder_(folder) : 0;
+    }
+
+    lines.push(home.name + ": " + total + " / " + expectedPerHome);
+    Logger.log("[" + home.name + "] Week total: " + total);
+  }
+
+  var rangeLabel = formatDate(weekStart) + " to " + formatDate(weekEnd);
+  var subject = "Weekly Trip Log Report - Week of " + rangeLabel + ", " + Utilities.formatDate(weekStart, tz, "yyyy");
+  var message = "Weekly Trip Log Report\nWeek of " + rangeLabel + "\n\n" +
+    lines.join("\n");
+
+  Logger.log(message);
+  GmailApp.sendEmail(getProgramManagerEmails_(), subject, message);
+}
+
+/** Finds the Drive folder for a given date without creating anything. Returns null if it doesn't exist. */
+function getExistingDayFolder_(rootFolder, date) {
+  var monthNames = ["January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"];
+  var weekStart = getWeekStart(date);
+  var weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 6);
+
+  var names = [
+    String(date.getFullYear()),
+    String(date.getMonth() + 1).padStart(2, "0") + " - " + monthNames[date.getMonth()],
+    formatDate(weekStart) + " to " + formatDate(weekEnd),
+    formatDate(date)
+  ];
+
+  var folder = rootFolder;
+  for (var i = 0; i < names.length; i++) {
+    var it = folder.getFoldersByName(names[i]);
+    if (!it.hasNext()) return null;
+    folder = it.next();
+  }
+  return folder;
+}
